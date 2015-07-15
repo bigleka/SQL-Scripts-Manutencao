@@ -1,0 +1,247 @@
+use master
+go
+
+alter database Any_Database set enable_broker with rollback immediate
+go
+
+alter database Any_Database set TRUSTWORTHY on 
+
+use Any_Database
+go
+
+create TABLE [dbo].[SQLDeadlockEvents](
+[EventRowID] [bigint] primary key IDENTITY(1,1) NOT NULL,
+[EventType] [nvarchar](128) NOT NULL,
+[AlertTime] [datetime] NULL,
+[DeadlockGraph] [xml] NULL,
+[DatabaseName] [sysname] null,
+[AuditDate] [smalldatetime]
+) ON [FG_Adm_Bdados_Data_01]
+with (data_compression = PAGE)
+GO
+
+CREATE QUEUE [DeadlockGraphQueue]
+GO
+
+CREATE SERVICE [DeadlockEventsService]
+AUTHORIZATION [dbo]
+ON QUEUE [dbo].[DeadLockGraphQueue] 
+([http://schemas.microsoft.com/SQL/Notifications/PostEventNotification])
+GO
+
+CREATE ROUTE DeadlockGraphRoute
+WITH SERVICE_NAME = 'DeadlockEventsService',
+ADDRESS = 'LOCAL';
+GO
+
+DECLARE @AuditServiceBrokerGuid [uniqueidentifier]
+,@SQL [varchar](max);
+
+-- Retrieving the service broker guid of CaptureDeadlockGraph database
+SELECT @AuditServiceBrokerGuid = [service_broker_guid]
+FROM [master].[sys].[databases]
+WHERE [name] = 'Any_Database'
+
+-- Building and executing dynamic SQL to create event notification objects
+-- Dynamic SQL to create eAuditLoginNotification event notification object
+
+SET @SQL = 'IF EXISTS (SELECT * FROM sys.server_event_notifications 
+WHERE name = ''DeadlockGraphEventNotification'')
+
+DROP EVENT NOTIFICATION DeadlockGraphEventNotification ON SERVER 
+
+CREATE EVENT NOTIFICATION DeadlockGraphEventNotification 
+ON SERVER
+WITH fan_in
+FOR DEADLOCK_GRAPH
+TO SERVICE ''DeadlockEventsService'', '''
++ CAST(@AuditServiceBrokerGuid AS [varchar](50)) + ''';'
+EXEC (@SQL)
+GO
+
+
+
+SELECT * FROM [sys].[server_event_notifications]
+WHERE [name] = 'DeadlockGraphEventNotification';
+GO
+
+
+alter PROC [dbo].[usp_sCaptureDeadlockGraph]
+AS BEGIN
+
+SET NOCOUNT ON
+SET CONCAT_NULL_YIELDS_NULL ON
+SET ANSI_PADDING ON
+SET ANSI_WARNINGS ON
+
+DECLARE @SQLProcedureName [varchar](64)
+SET @SQLProcedureName = 'usp_sCaptureDeadlockGraph'
+
+BEGIN TRY
+
+DECLARE @message_body [xml]
+, @EventTime [datetime]
+, @EventType [varchar](128) 
+, @message_type_name [nvarchar](256)
+, @dialog [uniqueidentifier]
+
+-- Endless loop
+WHILE (1 = 1)
+BEGIN
+BEGIN TRANSACTION ;
+
+-- Receive the next available message
+WAITFOR (RECEIVE TOP(1)
+@message_type_name = [message_type_name],
+@message_body = [message_body],
+@dialog = [conversation_handle]
+FROM [dbo].[DeadlockGraphQueue]), TIMEOUT 2000
+
+-- Rollback and exit if no messages were found
+IF (@@ROWCOUNT = 0)
+BEGIN
+ROLLBACK TRANSACTION;
+BREAK;
+END;
+
+-- End conversation of end dialog message
+IF (@message_type_name = 'http://schemas.microsoft.com/SQL/ServiceBroker/EndDialog')
+BEGIN
+PRINT 'End Dialog received for dialog # ' + CAST(@dialog as [nvarchar](40));
+END CONVERSATION @dialog;
+END;
+
+ELSE
+BEGIN
+
+SET @EventTime = CAST(CAST(@message_body.query('/EVENT_INSTANCE/PostTime/text()') AS [nvarchar](max)) AS [datetime])
+SET @EventType = CAST(@message_body.query('/EVENT_INSTANCE/EventType/text()') AS [nvarchar](128))
+
+INSERT INTO [dbo].[SQLDeadlockEvents] ([EventType], [AlertTime], [DeadlockGraph])
+VALUES (@EventType, @EventTime, @message_body)
+END
+
+COMMIT TRANSACTION
+
+DECLARE @MailSubject [nvarchar](256)
+,@MailBody [nvarchar](max)
+,@SQLQuery [nvarchar](max)
+,@AttachedFileName [nvarchar](256)
+,@EventDateTime [datetime]
+,@EventID [int]
+,@Counter [int]
+,@dbname [sysname]
+
+IF EXISTS (SELECT * FROM [tempdb].[dbo].[sysobjects] 
+WHERE name = '##ListDeadlocks' AND type in (N'U'))
+DROP TABLE ##ListDeadlocks
+
+CREATE TABLE ##ListDeadlocks 
+([EventRowID] [int]
+,[AlertTime] [datetime]
+,[DeadlockGraph] [xml]
+,[DeadlockXml] [xml])
+
+INSERT INTO ##ListDeadlocks 
+([EventRowID]
+,[AlertTime]
+,[DeadlockGraph]
+,[DeadlockXml])
+SELECT [EventRowID]
+,[AlertTime]
+,[DeadlockGraph].query('./EVENT_INSTANCE/TextData/deadlock-list')
+,DeadlockGraph FROM [dbo].[SQLDeadlockEvents] 
+WHERE [EventRowID] = @@IDENTITY
+
+select @dbname = db_name(DeadlockGraph.value( '(/deadlock-list//@dbid)[1]', 'int' ))
+--db_name(DeadlockGraph.value( '(/EVENT_INSTANCE/TextData/deadlock-list//@dbid)[1]', 'int' ) )
+FROM ##ListDeadlocks
+--where [EventRowID] = SCOPE_IDENTITY()
+
+update [dbo].[SQLDeadlockEvents] 
+set [DatabaseName] = @dbname
+where [EventRowID] = (select [EventRowID] FROM ##ListDeadlocks )
+
+SELECT @Counter = MIN(EventRowID) 
+FROM ##ListDeadlocks
+
+WHILE @Counter IS NOT NULL
+BEGIN
+
+SELECT @EventDateTime = [AlertTime]
+,@EventID = [EventRowID]
+FROM ##ListDeadlocks
+WHERE [EventRowID] = @Counter
+
+SELECT @MailSubject = 'Um deadlock ocorreu em ' + cast(@dbname as [varchar](256)) --+' servidor: '
+--+ CONVERT([varchar](128), SERVERPROPERTY('ServerName'))
+,@MailBody = 'Deadlock EventRowID: ' + CAST(@EventID AS [varchar](12))
++ char(13) + char(13) + 'O deadlock ocorreu as ' 
++ CONVERT([varchar](50), @EventDateTime, 120) 
++ ' no Servidor: ' + CONVERT([varchar](128), SERVERPROPERTY('ServerName'))+'.'+char(13) + char(13) + 'Verifique o anexo xdl-file para mais detalhes.'
++ char(13) + char(13) +'Para mais informações ou eventos anteriores consulte: SELECT * FROM Any_Database.dbo.SQLDeadlockEvents WITH (NOLOCK)'
+,@SQLQuery = 'SET NOCOUNT ON; SELECT [DeadlockGraph] FROM [##ListDeadlocks] WITH (READUNCOMMITTED) WHERE EventRowID = ' 
++ CAST(@EventID AS [varchar](10)) 
+,@AttachedFileName = CONVERT([varchar](128), SERVERPROPERTY('ServerName')) + '_' + CAST(@EventID AS [varchar](12)) + '.xdl'
+
+EXEC msdb.dbo.sp_send_dbmail
+@recipients = 'your@email.com'
+,@subject = @MailSubject
+,@body = @MailBody
+,@query = @SQLQuery
+,@attach_query_result_as_file = 1 ,@query_attachment_filename = @AttachedFileName -- http://support.microsoft.com/kb/924345 
+,@query_result_header = 0
+,@query_result_width = 32767
+,@query_no_truncate = 1
+
+DELETE FROM ##ListDeadlocks 
+WHERE EventRowID = @Counter
+
+SELECT @Counter = MIN(EventRowID) 
+FROM ##ListDeadlocks
+end
+
+
+END --End of loop
+
+END TRY 
+
+BEGIN CATCH 
+
+SELECT ERROR_NUMBER() 
+,ERROR_SEVERITY() 
+,ERROR_STATE() 
+,ISNULL(ERROR_PROCEDURE(), @SQLProcedureName)
+,ERROR_LINE() 
+,ERROR_MESSAGE() 
+
+END CATCH 
+
+END 
+GO
+
+
+ALTER QUEUE [dbo].[DeadlockGraphQueue]
+WITH STATUS = ON
+,ACTIVATION (PROCEDURE_NAME = [usp_sCaptureDeadlockGraph]
+,STATUS = ON
+,MAX_QUEUE_READERS = 1
+,EXECUTE AS OWNER)
+GO
+
+
+SELECT * FROM [dbo].[SQLDeadlockEvents]
+GO
+/*
+declare @dbname sysname
+select db_name(DeadlockGraph.value( '(/EVENT_INSTANCE/TextData/deadlock-list//@dbid)[1]', 'int' ) )
+FROM [dbo].[SQLDeadlockEvents] 
+where [EventRowID] = SCOPE_IDENTITY()
+
+update [dbo].[SQLDeadlockEvents] 
+set DatabaseName = @dbname
+where [EventRowID] = 6
+
+select *, DeadlockGraph.value( '(/deadlock-list//@dbid)[1]', 'int' )
+from ##ListDeadlocks
+*/
